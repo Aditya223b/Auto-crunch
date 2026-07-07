@@ -19,6 +19,8 @@ APP_NAME = "autocrunch"
 LABEL = "io.github.aditya223b.autocrunch.weekly-summary"
 DEFAULT_REPORT_HOUR = 9
 DEFAULT_REPORT_MINUTE = 0
+SEVERITY_ORDER = ["low", "medium", "high", "critical"]
+DEFAULT_AUTO_APPROVE_UNTIL = "medium"
 
 
 def home() -> Path:
@@ -27,6 +29,14 @@ def home() -> Path:
 
 def state_dir() -> Path:
     return Path(os.environ.get("AUTOCRUNCH_STATE_DIR", home() / ".local" / "share" / APP_NAME))
+
+
+def config_dir() -> Path:
+    return Path(os.environ.get("AUTOCRUNCH_CONFIG_DIR", home() / ".autocrunch"))
+
+
+def config_path() -> Path:
+    return config_dir() / "config.json"
 
 
 def reports_dir() -> Path:
@@ -44,6 +54,55 @@ def claude_projects_dir() -> Path:
 def ensure_state() -> None:
     state_dir().mkdir(parents=True, exist_ok=True)
     reports_dir().mkdir(parents=True, exist_ok=True)
+
+
+def default_config() -> dict[str, Any]:
+    return {
+        "policy": {
+            "auto_approve_until": DEFAULT_AUTO_APPROVE_UNTIL,
+            "critical_requires_human": True,
+        },
+        "tools": {
+            "claude": {"enabled": True, "binary": "claude"},
+            "codex": {"enabled": True, "binary": "codex"},
+        },
+        "whatsapp": {
+            "provider": "meta_cloud_api",
+            "enabled": False,
+        },
+    }
+
+
+def load_config() -> dict[str, Any]:
+    path = config_path()
+    if not path.exists():
+        return default_config()
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            loaded = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return default_config()
+
+    config = default_config()
+    for section, value in loaded.items():
+        if isinstance(value, dict) and isinstance(config.get(section), dict):
+            config[section].update(value)
+        else:
+            config[section] = value
+    return config
+
+
+def save_config(config: dict[str, Any]) -> None:
+    config_dir().mkdir(parents=True, exist_ok=True)
+    with config_path().open("w", encoding="utf-8") as handle:
+        json.dump(config, handle, indent=2)
+        handle.write("\n")
+
+
+def auto_approves(severity: str, ceiling: str) -> bool:
+    if severity == "critical":
+        return False
+    return SEVERITY_ORDER.index(severity) <= SEVERITY_ORDER.index(ceiling)
 
 
 def utc_now() -> dt.datetime:
@@ -381,17 +440,56 @@ def command_uninstall_scheduler(_: argparse.Namespace) -> int:
 
 
 def command_doctor(_: argparse.Namespace) -> int:
+    config = load_config()
     claude_bin = resolve_claude_binary()
     print(f"Auto-crunch state: {state_dir()}")
+    print(f"Config: {config_path()}")
     print(f"Reports: {reports_dir()}")
+    print(f"Auto-approve until: {config['policy']['auto_approve_until']}")
     print(f"Claude binary: {claude_bin}")
     print(f"Claude found: {'yes' if Path(claude_bin).exists() or shutil.which(claude_bin) else 'no'}")
+    print(f"Codex found: {'yes' if shutil.which('codex') else 'no'}")
     print(f"Platform: {platform.system()} {platform.release()}")
     if platform.system() == "Darwin":
         path = launch_agent_path()
         print(f"LaunchAgent plist: {path}")
         result = run_launchctl("print", f"{launchctl_domain()}/{LABEL}")
         print(f"LaunchAgent loaded: {'yes' if result.returncode == 0 else 'no'}")
+    return 0
+
+
+def command_policy_init(_: argparse.Namespace) -> int:
+    if config_path().exists():
+        print(f"Config already exists: {config_path()}")
+        return 0
+    save_config(default_config())
+    print(f"Wrote default config: {config_path()}")
+    return 0
+
+
+def command_policy_show(_: argparse.Namespace) -> int:
+    print(json.dumps(load_config(), indent=2))
+    return 0
+
+
+def command_policy_set(args: argparse.Namespace) -> int:
+    config = load_config()
+    config["policy"]["auto_approve_until"] = args.auto_approve_until
+    save_config(config)
+    print(f"Auto-approve ceiling set to: {args.auto_approve_until}")
+    if args.auto_approve_until == "high":
+        print("High-severity actions may be auto-approved. Critical actions still require a human.")
+    return 0
+
+
+def command_policy_explain(_: argparse.Namespace) -> int:
+    config = load_config()
+    ceiling = config["policy"]["auto_approve_until"]
+    print(f"Current auto-approve ceiling: {ceiling}")
+    print()
+    for severity in SEVERITY_ORDER:
+        decision = "auto-approve" if auto_approves(severity, ceiling) else "ask/deny"
+        print(f"{severity}: {decision}")
     return 0
 
 
@@ -432,6 +530,27 @@ def build_parser() -> argparse.ArgumentParser:
 
     doctor_parser = sub.add_parser("doctor", help="Print setup diagnostics.")
     doctor_parser.set_defaults(func=command_doctor)
+
+    policy_parser = sub.add_parser("policy", help="Manage approval policy.")
+    policy_sub = policy_parser.add_subparsers(dest="policy_command", required=True)
+
+    policy_init = policy_sub.add_parser("init", help="Create the default config file.")
+    policy_init.set_defaults(func=command_policy_init)
+
+    policy_show = policy_sub.add_parser("show", help="Print the active config.")
+    policy_show.set_defaults(func=command_policy_show)
+
+    policy_set = policy_sub.add_parser("set", help="Set the auto-approve severity ceiling.")
+    policy_set.add_argument(
+        "--auto-approve-until",
+        choices=["low", "medium", "high"],
+        required=True,
+        help="Highest severity level Auto-crunch may approve without asking.",
+    )
+    policy_set.set_defaults(func=command_policy_set)
+
+    policy_explain = policy_sub.add_parser("explain", help="Explain the current approval behavior.")
+    policy_explain.set_defaults(func=command_policy_explain)
 
     return parser
 
