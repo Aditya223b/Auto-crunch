@@ -2,7 +2,7 @@
 
 Auto-crunch is a macOS-first terminal supervisor for AI coding CLIs. The goal is to reduce routine permission interruptions, classify requested actions by severity, route real clarification questions to WhatsApp, and keep an audit trail.
 
-Current implementation: a Claude Code launcher, policy config, and weekly summaries.
+Current implementation: a Claude/Codex launcher that avoids native auto/bypass modes, policy config, and weekly summaries.
 
 Planned v0.1 supervisor support:
 
@@ -27,13 +27,19 @@ export PATH="$HOME/.local/bin:$PATH"
 Start Claude Code in the current project:
 
 ```bash
-autocrunch run
+autocrunch start claude
+```
+
+Start Codex in the current project:
+
+```bash
+autocrunch start codex
 ```
 
 Pass arguments through to Claude Code:
 
 ```bash
-autocrunch run -- --model sonnet
+autocrunch start claude -- --model sonnet
 ```
 
 Write a report manually:
@@ -86,21 +92,21 @@ Weekly reports are written to:
 
 Reports intentionally avoid full prompts, full command bodies, and file contents. They summarize launches, recent Claude session counts, tool usage, and command heads.
 
-## Permission Modes
+## Permission Model
 
-The current launcher uses Claude Code's native permission mode:
+Auto-crunch should not rely on native CLI auto modes. The goal is:
 
-```bash
-autocrunch run
-```
+- Launch Claude Code and Codex in permission-asking mode.
+- Let Auto-crunch inspect each requested permission.
+- Auto-approve only when the request is within the user's configured severity ceiling.
+- Route planning, PRD, tech-stack, architecture, product, and clarification decisions to the owner.
 
-This uses:
+Current bootstrap behavior:
 
-```text
-claude --permission-mode auto --add-dir "$PWD"
-```
-
-The fuller supervisor will use Auto-crunch's own severity policy before approving prompts from Claude Code or Codex.
+- `autocrunch start claude` uses Claude Code manual permission mode.
+- `autocrunch start codex` uses Codex approval prompts.
+- Native Claude/Codex auto and bypass modes are not used by default.
+- Full prompt interception and automatic approval is the next implementation milestone.
 
 ## Severity Policy
 
@@ -125,13 +131,14 @@ Allowed values:
 
 `critical` actions are not auto-approved by default. Examples: secret exfiltration, destructive system commands, credential access, `sudo` with destructive commands, disabling security tools, force-pushing protected branches, and modifying Auto-crunch policy to reduce oversight.
 
-Advanced risky mode:
+Deprecated risky behavior:
 
 ```bash
-autocrunch run --mode bypassPermissions --i-understand-risk
+claude --permission-mode auto
+codex --ask-for-approval never
 ```
 
-This bypasses Claude Code permission checks. Use it only in a sandbox or throwaway dev environment.
+Auto-crunch does not use these as its product model because they let the underlying CLI decide too much.
 
 ## Target WhatsApp Flow
 

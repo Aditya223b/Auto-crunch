@@ -21,6 +21,7 @@ DEFAULT_REPORT_HOUR = 9
 DEFAULT_REPORT_MINUTE = 0
 SEVERITY_ORDER = ["low", "medium", "high", "critical"]
 DEFAULT_AUTO_APPROVE_UNTIL = "medium"
+DEFAULT_TOOL = "claude"
 
 
 def home() -> Path:
@@ -144,47 +145,59 @@ def append_jsonl(path: Path, item: dict[str, Any]) -> None:
         handle.write(json.dumps(item, ensure_ascii=False) + "\n")
 
 
-def resolve_claude_binary() -> str:
-    configured = os.environ.get("AUTOCRUNCH_CLAUDE_BIN")
+def resolve_tool_binary(tool: str) -> str:
+    env_name = f"AUTOCRUNCH_{tool.upper()}_BIN"
+    configured = os.environ.get(env_name)
     if configured:
         return configured
-    found = shutil.which("claude")
+    found = shutil.which(tool)
     if found:
         return found
-    fallback = home() / ".local" / "bin" / "claude"
+    fallback = home() / ".local" / "bin" / tool
     return str(fallback)
 
 
 def command_run(args: argparse.Namespace) -> int:
-    mode = args.mode
-    if mode == "bypassPermissions" and not args.i_understand_risk:
-        print(
-            "Refusing bypassPermissions without --i-understand-risk. "
-            "Use this only in a sandbox or throwaway dev environment.",
-            file=sys.stderr,
-        )
+    tool = args.tool
+    if args.mode in {"auto", "bypassPermissions"}:
+        print("Auto-crunch does not use native CLI auto/bypass modes.", file=sys.stderr)
+        print("Use `autocrunch start claude` or `autocrunch start codex` so prompts remain supervisable.", file=sys.stderr)
         return 2
 
     cwd = Path.cwd().resolve()
-    claude_bin = resolve_claude_binary()
+    tool_bin = resolve_tool_binary(tool)
     passthrough_args = list(args.claude_args)
     if passthrough_args and passthrough_args[0] == "--":
         passthrough_args = passthrough_args[1:]
 
-    claude_args = [claude_bin, "--permission-mode", mode, "--add-dir", str(cwd)]
-    claude_args.extend(passthrough_args)
+    if tool == "claude":
+        tool_args = [tool_bin, "--permission-mode", args.mode, "--add-dir", str(cwd)]
+    elif tool == "codex":
+        approval = "untrusted" if args.mode == "manual" else "on-request"
+        tool_args = [tool_bin, "--cd", str(cwd), "--ask-for-approval", approval]
+    else:
+        print(f"Unsupported tool: {tool}", file=sys.stderr)
+        return 2
+
+    tool_args.extend(passthrough_args)
 
     append_jsonl(
         launch_log(),
         {
             "timestamp": utc_now().isoformat(),
             "cwd": str(cwd),
-            "mode": mode,
-            "claude_args": passthrough_args,
+            "tool": tool,
+            "mode": args.mode,
+            "tool_args": passthrough_args,
         },
     )
 
-    os.execvp(claude_bin, claude_args)
+    print(
+        "Auto-crunch supervisor note: native auto mode is disabled. "
+        "This launch keeps CLI permission prompts visible until Auto-crunch prompt interception is implemented.",
+        file=sys.stderr,
+    )
+    os.execvp(tool_bin, tool_args)
     return 127
 
 
@@ -441,14 +454,16 @@ def command_uninstall_scheduler(_: argparse.Namespace) -> int:
 
 def command_doctor(_: argparse.Namespace) -> int:
     config = load_config()
-    claude_bin = resolve_claude_binary()
+    claude_bin = resolve_tool_binary("claude")
+    codex_bin = resolve_tool_binary("codex")
     print(f"Auto-crunch state: {state_dir()}")
     print(f"Config: {config_path()}")
     print(f"Reports: {reports_dir()}")
     print(f"Auto-approve until: {config['policy']['auto_approve_until']}")
     print(f"Claude binary: {claude_bin}")
     print(f"Claude found: {'yes' if Path(claude_bin).exists() or shutil.which(claude_bin) else 'no'}")
-    print(f"Codex found: {'yes' if shutil.which('codex') else 'no'}")
+    print(f"Codex binary: {codex_bin}")
+    print(f"Codex found: {'yes' if Path(codex_bin).exists() or shutil.which(codex_bin) else 'no'}")
     print(f"Platform: {platform.system()} {platform.release()}")
     if platform.system() == "Darwin":
         path = launch_agent_path()
@@ -456,6 +471,17 @@ def command_doctor(_: argparse.Namespace) -> int:
         result = run_launchctl("print", f"{launchctl_domain()}/{LABEL}")
         print(f"LaunchAgent loaded: {'yes' if result.returncode == 0 else 'no'}")
     return 0
+
+
+def command_start(args: argparse.Namespace) -> int:
+    print(
+        "Full Auto-crunch supervision is not implemented yet. "
+        "Starting the tool in permission-asking mode, not native auto mode.",
+        file=sys.stderr,
+    )
+    args.mode = "manual"
+    args.claude_args = args.tool_args
+    return command_run(args)
 
 
 def command_policy_init(_: argparse.Namespace) -> int:
@@ -496,23 +522,29 @@ def command_policy_explain(_: argparse.Namespace) -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="autocrunch",
-        description="Terminal helper for low-friction Claude Code sessions and weekly summaries.",
+        description="Terminal supervisor for AI coding CLIs and weekly summaries.",
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
-    run_parser = sub.add_parser("run", help="Start Claude Code in the current project.")
+    start_parser = sub.add_parser("start", help="Start an AI CLI in supervisable permission-asking mode.")
+    start_parser.add_argument("tool", choices=["claude", "codex"], help="AI CLI to start.")
+    start_parser.add_argument("tool_args", nargs=argparse.REMAINDER, help="Arguments passed to the tool.")
+    start_parser.set_defaults(func=command_start)
+
+    run_parser = sub.add_parser("run", help="Compatibility alias for `start claude`.")
+    run_parser.add_argument(
+        "--tool",
+        choices=["claude", "codex"],
+        default=DEFAULT_TOOL,
+        help="AI CLI to start. Default: claude.",
+    )
     run_parser.add_argument(
         "--mode",
-        choices=["auto", "acceptEdits", "dontAsk", "manual", "bypassPermissions"],
-        default=os.environ.get("AUTOCRUNCH_PERMISSION_MODE", "auto"),
-        help="Claude Code permission mode. Default: auto.",
+        choices=["manual", "acceptEdits", "dontAsk"],
+        default=os.environ.get("AUTOCRUNCH_PERMISSION_MODE", "manual"),
+        help="Underlying CLI permission mode. Default: manual.",
     )
-    run_parser.add_argument(
-        "--i-understand-risk",
-        action="store_true",
-        help="Required when using --mode bypassPermissions.",
-    )
-    run_parser.add_argument("claude_args", nargs=argparse.REMAINDER, help="Arguments passed to claude.")
+    run_parser.add_argument("claude_args", nargs=argparse.REMAINDER, help="Arguments passed to the tool.")
     run_parser.set_defaults(func=command_run)
 
     summary_parser = sub.add_parser("summary", help="Write a weekly markdown summary.")
