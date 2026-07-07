@@ -3,13 +3,21 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import errno
+import fcntl
 import glob
 import json
 import os
 import platform
+import pty
+import re
+import select
 import shutil
+import signal
 import subprocess
 import sys
+import termios
+import tty
 from collections import Counter
 from pathlib import Path
 from typing import Any
@@ -104,6 +112,192 @@ def auto_approves(severity: str, ceiling: str) -> bool:
     if severity == "critical":
         return False
     return SEVERITY_ORDER.index(severity) <= SEVERITY_ORDER.index(ceiling)
+
+
+ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+CONTROL_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")
+
+
+def clean_terminal_text(text: str) -> str:
+    text = ANSI_RE.sub("", text)
+    text = text.replace("\r", "\n")
+    return CONTROL_RE.sub("", text)
+
+
+def classify_command(command: str, cwd: Path) -> tuple[str, str]:
+    normalized = " ".join(command.strip().split())
+    lowered = normalized.lower()
+
+    critical_patterns = [
+        "rm -rf /",
+        "sudo rm",
+        "chmod -r",
+        "chown -r",
+        "git push --force",
+        "git push -f",
+        ".ssh/",
+        "id_rsa",
+        "keychain",
+        "security find-generic-password",
+        "launchctl unload",
+        "spctl --master-disable",
+    ]
+    if any(pattern in lowered for pattern in critical_patterns):
+        return "critical", "matches a critical destructive, credential, or security-sensitive pattern"
+
+    if re.search(r"(^|\s)(rm|trash|unlink)\s", lowered):
+        return "high", "deletes files"
+    if "git push" in lowered:
+        return "high", "publishes code or refs to a remote"
+    if "curl" in lowered and re.search(r"\|\s*(bash|sh|zsh)", lowered):
+        return "high", "downloads and executes remote code"
+    if "sudo " in lowered:
+        return "high", "requests elevated privileges"
+    if str(home()).lower() in lowered and str(cwd).lower() not in lowered:
+        return "high", "references paths outside the current project"
+
+    medium_patterns = [
+        "git pull",
+        "npm install",
+        "pnpm install",
+        "yarn install",
+        "pip install",
+        "uv pip install",
+        "cargo build",
+        "go mod download",
+        "curl ",
+        "wget ",
+    ]
+    if any(pattern in lowered for pattern in medium_patterns):
+        return "medium", "routine dependency, network, or git synchronization command"
+
+    low_heads = ("cd ", "ls ", "find ", "cat ", "sed ", "head ", "tail ", "grep ", "rg ", "git status", "git log", "git diff", "echo ")
+    if lowered.startswith(low_heads) or " git status" in lowered or " git log" in lowered:
+        return "low", "read-only project inspection command"
+
+    return "medium", "general shell command without critical indicators"
+
+
+def extract_claude_bash_command(cleaned_buffer: str) -> str | None:
+    if "Bash command" not in cleaned_buffer or "Do you want to proceed?" not in cleaned_buffer:
+        return None
+    tail = cleaned_buffer.rsplit("Bash command", 1)[-1]
+    tail = tail.split("Do you want to proceed?", 1)[0]
+    lines = [line.strip() for line in tail.splitlines()]
+    command_lines: list[str] = []
+    for line in lines:
+        if not line:
+            continue
+        if line.startswith("This command") or line.startswith("Approve only") or line.startswith("Do you want"):
+            break
+        if line.startswith("$ "):
+            command_lines.append(line[2:].strip())
+            continue
+        if line.startswith(("Scout ", "Read ", "Run ", "Inspect ", "Check ")):
+            if command_lines:
+                break
+        if command_lines or any(token in line for token in (" && ", "git ", "cd ", "ls ", "find ", "npm ", "pnpm ", "python ", "curl ")):
+            if re.match(r"^\d+\.\s+", line):
+                break
+            command_lines.append(line)
+    command = " ".join(command_lines).strip()
+    return command or None
+
+
+def copy_terminal_size(master_fd: int) -> None:
+    try:
+        size = fcntl.ioctl(sys.stdin.fileno(), termios.TIOCGWINSZ, b"\0" * 8)
+        fcntl.ioctl(master_fd, termios.TIOCSWINSZ, size)
+    except OSError:
+        pass
+
+
+def supervise_pty(tool_args: list[str], cwd: Path, tool: str) -> int:
+    config = load_config()
+    ceiling = config["policy"]["auto_approve_until"]
+    ensure_state()
+
+    pid, master_fd = pty.fork()
+    if pid == 0:
+        os.chdir(str(cwd))
+        os.execvp(tool_args[0], tool_args)
+
+    copy_terminal_size(master_fd)
+    old_tty = termios.tcgetattr(sys.stdin.fileno()) if sys.stdin.isatty() else None
+    if old_tty:
+        tty.setraw(sys.stdin.fileno())
+
+    output_buffer = ""
+    approved_prompts: set[str] = set()
+    exit_code = 0
+
+    def handle_resize(signum: int, frame: Any) -> None:
+        copy_terminal_size(master_fd)
+        try:
+            os.kill(pid, signal.SIGWINCH)
+        except OSError:
+            pass
+
+    previous_winch = signal.signal(signal.SIGWINCH, handle_resize)
+
+    try:
+        while True:
+            readable, _, _ = select.select([master_fd, sys.stdin.fileno()], [], [])
+            if master_fd in readable:
+                try:
+                    data = os.read(master_fd, 4096)
+                except OSError as exc:
+                    if exc.errno == errno.EIO:
+                        break
+                    raise
+                if not data:
+                    break
+                os.write(sys.stdout.fileno(), data)
+                chunk = data.decode("utf-8", errors="ignore")
+                output_buffer = (output_buffer + clean_terminal_text(chunk))[-12000:]
+
+                if tool == "claude":
+                    command = extract_claude_bash_command(output_buffer)
+                    if command and command not in approved_prompts:
+                        approved_prompts.add(command)
+                        severity, reason = classify_command(command, cwd)
+                        append_jsonl(
+                            state_dir() / "decisions.jsonl",
+                            {
+                                "timestamp": utc_now().isoformat(),
+                                "tool": tool,
+                                "cwd": str(cwd),
+                                "type": "permission",
+                                "severity": severity,
+                                "reason": reason,
+                                "decision": "auto_allow" if auto_approves(severity, ceiling) else "ask_user",
+                                "command_head": command.split()[0] if command.split() else "",
+                            },
+                        )
+                        if auto_approves(severity, ceiling):
+                            notice = f"\n[Auto-crunch] Auto-approved {severity} permission: {reason}\n"
+                            os.write(sys.stdout.fileno(), notice.encode())
+                            os.write(master_fd, b"1\r")
+                        else:
+                            notice = f"\n[Auto-crunch] Holding for owner approval: {severity} permission, {reason}\n"
+                            os.write(sys.stdout.fileno(), notice.encode())
+
+            if sys.stdin.fileno() in readable:
+                data = os.read(sys.stdin.fileno(), 4096)
+                if not data:
+                    break
+                os.write(master_fd, data)
+    finally:
+        signal.signal(signal.SIGWINCH, previous_winch)
+        if old_tty:
+            termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, old_tty)
+        try:
+            _, status = os.waitpid(pid, 0)
+            if os.WIFEXITED(status):
+                exit_code = os.WEXITSTATUS(status)
+        except ChildProcessError:
+            pass
+    return exit_code
 
 
 def utc_now() -> dt.datetime:
@@ -474,14 +668,36 @@ def command_doctor(_: argparse.Namespace) -> int:
 
 
 def command_start(args: argparse.Namespace) -> int:
-    print(
-        "Full Auto-crunch supervision is not implemented yet. "
-        "Starting the tool in permission-asking mode, not native auto mode.",
-        file=sys.stderr,
+    tool = args.tool
+    cwd = Path.cwd().resolve()
+    tool_bin = resolve_tool_binary(tool)
+    passthrough_args = list(args.tool_args)
+    if passthrough_args and passthrough_args[0] == "--":
+        passthrough_args = passthrough_args[1:]
+
+    if tool == "claude":
+        tool_args = [tool_bin, "--permission-mode", "manual", "--add-dir", str(cwd)]
+    elif tool == "codex":
+        tool_args = [tool_bin, "--cd", str(cwd), "--ask-for-approval", "untrusted"]
+    else:
+        print(f"Unsupported tool: {tool}", file=sys.stderr)
+        return 2
+
+    tool_args.extend(passthrough_args)
+    append_jsonl(
+        launch_log(),
+        {
+            "timestamp": utc_now().isoformat(),
+            "cwd": str(cwd),
+            "tool": tool,
+            "mode": "supervised-manual",
+            "tool_args": passthrough_args,
+        },
     )
-    args.mode = "manual"
-    args.claude_args = args.tool_args
-    return command_run(args)
+
+    print(f"[Auto-crunch] Supervising {tool}. Native auto/bypass mode is disabled.", file=sys.stderr)
+    print(f"[Auto-crunch] Auto-approve ceiling: {load_config()['policy']['auto_approve_until']}", file=sys.stderr)
+    return supervise_pty(tool_args, cwd, tool)
 
 
 def command_policy_init(_: argparse.Namespace) -> int:

@@ -2,7 +2,7 @@
 
 Auto-crunch is a macOS-first terminal supervisor for AI coding CLIs. The goal is to reduce routine permission interruptions, classify requested actions by severity, route real clarification questions to WhatsApp, and keep an audit trail.
 
-Current implementation: a Claude/Codex launcher that avoids native auto/bypass modes, policy config, and weekly summaries.
+Current implementation: a Claude supervisor for Bash permission prompts, a Codex launcher that avoids native auto/bypass modes, policy config, and weekly summaries.
 
 Planned v0.1 supervisor support:
 
@@ -101,12 +101,13 @@ Auto-crunch should not rely on native CLI auto modes. The goal is:
 - Auto-approve only when the request is within the user's configured severity ceiling.
 - Route planning, PRD, tech-stack, architecture, product, and clarification decisions to the owner.
 
-Current bootstrap behavior:
+Current behavior:
 
-- `autocrunch start claude` uses Claude Code manual permission mode.
+- `autocrunch start claude` uses Claude Code manual permission mode inside an Auto-crunch PTY supervisor.
+- Claude Bash permission prompts are classified and auto-approved when they fall within the user's configured severity ceiling.
 - `autocrunch start codex` uses Codex approval prompts.
 - Native Claude/Codex auto and bypass modes are not used by default.
-- Full prompt interception and automatic approval is the next implementation milestone.
+- Owner-decision routing and Codex prompt interception are the next implementation milestones.
 
 ## Severity Policy
 
